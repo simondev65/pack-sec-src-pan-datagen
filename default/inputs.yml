@@ -1,0 +1,10 @@
+inputs:
+  datagen_pan_pack:
+    disabled: false
+    sendToRoutes: true
+    pqEnabled: false
+    streamtags: []
+    samples:
+      - eventsPerSec: 10
+        sample: palo_alto_traffic
+    type: datagen
