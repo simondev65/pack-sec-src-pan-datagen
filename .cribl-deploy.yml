@@ -1,0 +1,21 @@
+# Cribl Pack Deployment — Per-Repo Override
+#
+# This file is OPTIONAL. Only add it to repos that need a worker group
+# mapping that differs from the org-wide defaults.
+#
+# Org-wide defaults are set as GitHub org variables (one change = all repos):
+#   CRIBL_WG_DEV   → default dev worker group
+#   CRIBL_WG_MAIN  → default staging worker group
+#   CRIBL_WG_PROD  → default prod worker group
+#
+# To override for THIS pack only, uncomment and fill in:
+#
+# pack_id: pack-sec-src-pan-datagen
+#
+# deployments:
+#   dev:
+#     worker_group: some-other-dev-group
+#   prod:
+#     worker_group: some-other-prod-group
+#
+# Branches not listed here fall back to the org-wide default.
