@@ -1,0 +1,302 @@
+name: Cribl Pack CI/CD
+
+# Triggers and what they do:
+#
+#   push (branch)      → deploy latest commit to the mapped worker group
+#   push (tag v*.*.*)  → deploy that exact version to the prod worker group
+#   workflow_dispatch  → manual: pick any tag/branch + optional worker group override
+#   pull_request       → validate + build only, no deploy
+#
+# Manual deploy from GitHub UI:
+#   Actions tab → "Cribl Pack CI/CD" → "Run workflow"
+#   • "Ref"          : tag (v1.2.0) or branch (dev) to deploy
+#   • "Worker group" : leave empty to use the default mapping, or type any group name
+on:
+  push:
+    branches: [dev, main, prod]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [dev, main, prod]
+  workflow_dispatch:
+    inputs:
+      worker_group:
+        description: 'Worker group override (leave empty to use default mapping)'
+        required: false
+        default: ''
+
+jobs:
+  deploy:
+    name: Validate › Build › Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Pack metadata ─────────────────────────────────────────────────────
+      - name: Read pack metadata
+        run: |
+          PACK_NAME=$(python3 -c "import json; print(json.load(open('package.json'))['name'])")
+          PACK_VERSION=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
+          echo "PACK_NAME=$PACK_NAME"     >> $GITHUB_ENV
+          echo "PACK_VERSION=$PACK_VERSION" >> $GITHUB_ENV
+          echo "Pack: $PACK_NAME  version: $PACK_VERSION"
+
+      # ── 3. Validate ───────────────────────────────────────────────────────────
+      - name: Validate package.json
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+          with open('package.json') as f:
+              pkg = json.load(f)
+          required = ['name', 'version', 'displayName', 'minLogStreamVersion']
+          missing = [k for k in required if k not in pkg]
+          if missing:
+              print(f'ERROR: package.json is missing required fields: {missing}')
+              sys.exit(1)
+          print(f'  name            : {pkg["name"]}')
+          print(f'  version         : {pkg["version"]}')
+          print(f'  displayName     : {pkg["displayName"]}')
+          print(f'  minLogStream    : {pkg["minLogStreamVersion"]}')
+          print('package.json OK')
+          EOF
+
+      - name: Validate YAML files
+        run: |
+          python3 - <<'EOF'
+          import yaml, pathlib, sys
+          errors = []
+          files = list(pathlib.Path('.').rglob('*.yml')) + list(pathlib.Path('.').rglob('*.yaml'))
+          for f in sorted(files):
+              skip_prefixes = ['.git', '.github', '.cribl-deploy']
+              if any(str(f).startswith(p) or f'./{p}' in str(f) for p in skip_prefixes):
+                  continue
+              try:
+                  with open(f) as fh:
+                      yaml.safe_load(fh)
+                  print(f'  OK  {f}')
+              except yaml.YAMLError as e:
+                  errors.append(f'{f}: {e}')
+          if errors:
+              print('\nYAML validation FAILED:')
+              for e in errors:
+                  print(f'  {e}')
+              sys.exit(1)
+          print('All YAML files OK')
+          EOF
+
+      # ── 4. Resolve target worker group ────────────────────────────────────────
+      #
+      #    Resolution priority (highest → lowest):
+      #
+      #      1. workflow_dispatch explicit input
+      #            → "Worker group" field in the GitHub UI "Run workflow" form
+      #            → Overrides everything; use for ad-hoc / emergency deploys
+      #
+      #      2. Per-repo override via .cribl-deploy.yml
+      #            → Only needed for packs that deviate from the org default
+      #            → Checked against branch name (or "prod" for tag pushes)
+      #
+      #      3. Tag push (v*.*.*)
+      #            → Always resolves to CRIBL_WG_PROD org variable
+      #
+      #      4. Branch push
+      #            → Resolves to CRIBL_WG_<BRANCH> org variable
+      #            → e.g. push to "dev" → CRIBL_WG_DEV
+      #
+      #    Org-level variables (GitHub → Settings → Variables → Actions):
+      #      CRIBL_WG_DEV    →  e.g. dev-workers
+      #      CRIBL_WG_MAIN   →  e.g. staging-workers
+      #      CRIBL_WG_PROD   →  e.g. prod-workers
+      #
+      #    Skipped on pull_request events (read-only validation run).
+      - name: Resolve worker group
+        id: mapping
+        if: github.event_name != 'pull_request'
+        env:
+          REF_NAME:             ${{ github.ref_name }}
+          EVENT_NAME:           ${{ github.event_name }}
+          INPUT_WORKER_GROUP:   ${{ inputs.worker_group }}
+          CRIBL_WG_DEV:         ${{ vars.CRIBL_WG_DEV }}
+          CRIBL_WG_MAIN:        ${{ vars.CRIBL_WG_MAIN }}
+          CRIBL_WG_PROD:        ${{ vars.CRIBL_WG_PROD }}
+        run: |
+          WORKER_GROUP=$(python3 - <<'EOF'
+          import os, sys, re, pathlib
+
+          ref        = os.environ['REF_NAME']
+          event      = os.environ['EVENT_NAME']
+          is_tag     = bool(re.match(r'^v\d+\.\d+\.\d+', ref))
+
+          def resolve(label, wg):
+              print(f'[{label}] → {wg}', file=sys.stderr)
+              print(wg)
+              sys.exit(0)
+
+          # 1. Explicit workflow_dispatch input
+          manual_wg = os.environ.get('INPUT_WORKER_GROUP', '').strip()
+          if manual_wg:
+              resolve('manual input', manual_wg)
+
+          # Determine the logical branch for .cribl-deploy.yml and org-var lookup
+          lookup_branch = 'prod' if is_tag else ref
+
+          # 2. Per-repo .cribl-deploy.yml override
+          if pathlib.Path('.cribl-deploy.yml').exists():
+              import yaml
+              with open('.cribl-deploy.yml') as f:
+                  config = yaml.safe_load(f)
+              deployments = config.get('deployments', {})
+              if lookup_branch in deployments:
+                  wg = deployments[lookup_branch].get('worker_group', '').strip()
+                  if wg:
+                      resolve('.cribl-deploy.yml override', wg)
+
+          # 3. Tag push → prod
+          # 4. Branch push → CRIBL_WG_<BRANCH>
+          env_key = f'CRIBL_WG_{lookup_branch.upper()}'
+          wg = os.environ.get(env_key, '').strip()
+          if wg:
+              label = f'tag→prod (org var {env_key})' if is_tag else f'org var {env_key}'
+              resolve(label, wg)
+
+          print(f'ERROR: Could not resolve a worker group for ref "{ref}".', file=sys.stderr)
+          if is_tag:
+              print(f'  Set org variable CRIBL_WG_PROD, or run workflow manually with a worker group override.', file=sys.stderr)
+          else:
+              print(f'  Set org variable {env_key}, or add .cribl-deploy.yml to this repo.', file=sys.stderr)
+          sys.exit(1)
+          EOF
+          )
+          echo "worker_group=$WORKER_GROUP" >> $GITHUB_OUTPUT
+          echo "Target worker group: $WORKER_GROUP"
+
+      # ── 5. Build .crbl archive ────────────────────────────────────────────────
+      - name: Build .crbl package
+        run: |
+          OUTFILE="${PACK_NAME}.crbl"
+          zip -r "$OUTFILE" . \
+            --exclude='.git/*' \
+            --exclude='.github/*' \
+            --exclude='.cribl-deploy.yml' \
+            --exclude='*.crbl'
+          SIZE=$(du -sh "$OUTFILE" | cut -f1)
+          echo "Built $OUTFILE  ($SIZE)"
+
+      # ── 6. Authenticate with Cribl Cloud ─────────────────────────────────────
+      - name: Authenticate with Cribl Cloud
+        id: auth
+        if: github.event_name != 'pull_request'
+        env:
+          CRIBL_CLIENT_ID: ${{ secrets.CRIBL_CLIENT_ID }}
+          CRIBL_CLIENT_SECRET: ${{ secrets.CRIBL_CLIENT_SECRET }}
+        run: |
+          RESPONSE=$(curl --silent --fail-with-body --request POST \
+            --url "https://login.cribl.cloud/oauth/token" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"grant_type\": \"client_credentials\",
+              \"client_id\": \"$CRIBL_CLIENT_ID\",
+              \"client_secret\": \"$CRIBL_CLIENT_SECRET\",
+              \"audience\": \"https://api.cribl.cloud\"
+            }")
+
+          TOKEN=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "Authentication successful"
+
+      # ── 7. Upload .crbl to the target worker group ───────────────────────────
+      - name: Upload pack
+        id: upload
+        if: github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+          WORKER_GROUP: ${{ steps.mapping.outputs.worker_group }}
+          BASE_URL: ${{ secrets.CRIBL_ORG_URL }}
+        run: |
+          FILENAME="${PACK_NAME}.crbl"
+          echo "Uploading $FILENAME to $WORKER_GROUP …"
+
+          RESPONSE=$(curl --silent --fail-with-body --request PUT \
+            --url "${BASE_URL}/api/v1/m/${WORKER_GROUP}/packs?filename=${FILENAME}" \
+            --header "Authorization: Bearer ${TOKEN}" \
+            --header "Accept-Encoding: gzip, deflate, br, zst" \
+            --header "Connection: keep-alive" \
+            --header "Content-Type: application/octet-stream" \
+            --data-binary "@${FILENAME}")
+
+          echo "Upload response: $RESPONSE"
+          SOURCE=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['source'])")
+          echo "source=$SOURCE" >> $GITHUB_OUTPUT
+
+      # ── 8. Install the uploaded pack ─────────────────────────────────────────
+      - name: Install pack
+        if: github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+          WORKER_GROUP: ${{ steps.mapping.outputs.worker_group }}
+          BASE_URL: ${{ secrets.CRIBL_ORG_URL }}
+          SOURCE: ${{ steps.upload.outputs.source }}
+        run: |
+          echo "Installing pack $PACK_NAME from $SOURCE …"
+
+          RESPONSE=$(curl --silent --fail-with-body --request POST \
+            --url "${BASE_URL}/api/v1/m/${WORKER_GROUP}/packs" \
+            --header "Authorization: Bearer ${TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"source\": \"${SOURCE}\",
+              \"id\": \"${PACK_NAME}\"
+            }")
+
+          echo "Install response: $RESPONSE"
+          VERSION=$(echo "$RESPONSE" | python3 -c "
+          import json, sys
+          r = json.load(sys.stdin)
+          items = r.get('items', [{}])
+          print(items[0].get('version', 'unknown')) if items else print('unknown')
+          ")
+          echo "Installed version: $VERSION"
+
+      # ── 9. Commit ─────────────────────────────────────────────────────────────
+      - name: Commit configuration
+        if: github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+          WORKER_GROUP: ${{ steps.mapping.outputs.worker_group }}
+          BASE_URL: ${{ secrets.CRIBL_ORG_URL }}
+        run: |
+          echo "Committing to $WORKER_GROUP …"
+
+          RESPONSE=$(curl --silent --fail-with-body --request POST \
+            --url "${BASE_URL}/api/v1/version/commit?groupId=${WORKER_GROUP}" \
+            --header "Authorization: Bearer ${TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"message\": \"Deploy ${PACK_NAME} v${PACK_VERSION} — github.com/${{ github.repository }}@${{ github.sha }}\"
+            }")
+
+          echo "Commit response: $RESPONSE"
+
+      # ── 10. Deploy ────────────────────────────────────────────────────────────
+      - name: Deploy to worker group
+        if: github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ steps.auth.outputs.token }}
+          WORKER_GROUP: ${{ steps.mapping.outputs.worker_group }}
+          BASE_URL: ${{ secrets.CRIBL_ORG_URL }}
+        run: |
+          echo "Deploying to $WORKER_GROUP …"
+
+          curl --silent --fail-with-body --request POST \
+            --url "${BASE_URL}/api/v1/products/stream/groups/${WORKER_GROUP}/deploy" \
+            --header "Authorization: Bearer ${TOKEN}" \
+            --header "Content-Type: application/json"
+
+          echo ""
+          echo "✓ ${PACK_NAME} v${PACK_VERSION} deployed to ${WORKER_GROUP}"
+          echo "  commit : ${{ github.sha }}"
+          echo "  branch : ${{ github.ref_name }}"
+          echo "  actor  : ${{ github.actor }}"
